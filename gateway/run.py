@@ -85,6 +85,142 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
     return _TELEGRAM_COMMAND_MENTION_RE.sub(_replace, text)
 
 
+_KANBAN_VERBOSE_EVENT_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+_KANBAN_BALANCED_EVENT_KINDS = ("completed", "blocked", "gave_up")
+
+
+def _compact_text(text: Any, limit: int) -> str:
+    """Collapse whitespace and trim to a human-scannable single line."""
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(1, limit - 1)].rstrip(" ,.;:—-") + "…"
+
+
+def _kanban_short_id(task_id: Any) -> str:
+    tid = str(task_id or "").strip()
+    m = re.search(r"t_[0-9a-fA-F]+", tid)
+    if m:
+        tid = m.group(0)
+    return tid[:6] if tid else "task"
+
+
+def _kanban_notifier_mode(mode: Optional[str] = None) -> str:
+    raw = (mode or os.getenv("HERMES_KANBAN_NOTIFIER_MODE") or "balanced").strip().lower()
+    return "verbose" if raw in {"verbose", "debug", "all"} else "balanced"
+
+
+def _kanban_notifier_event_kinds(mode: Optional[str] = None) -> tuple[str, ...]:
+    """Return event kinds worth pushing to chat for the notifier profile.
+
+    ``balanced`` is the default for Discord/gateway UX: only durable milestones
+    hit chat. Retry-loop internals (crashed/timed_out) remain in Kanban logs and
+    can be re-enabled with ``HERMES_KANBAN_NOTIFIER_MODE=verbose`` for debug.
+    """
+    if _kanban_notifier_mode(mode) == "verbose":
+        return _KANBAN_VERBOSE_EVENT_KINDS
+    return _KANBAN_BALANCED_EVENT_KINDS
+
+
+def _kanban_balanced_thread_name(title: Any, task_id: Optional[str] = None) -> str:
+    """Build an outcome-first, Discord-scannable Kanban handoff thread title."""
+    raw = _compact_text(title, 240)
+    detected_tid = task_id or ""
+    m_tid = re.search(r"\bt_[0-9a-fA-F]{4,}\b", raw)
+    if m_tid and not detected_tid:
+        detected_tid = m_tid.group(0)
+    short_tid = _kanban_short_id(detected_tid) if detected_tid else ""
+
+    clean = re.sub(r"\bHermes\b\s*[—:-]?\s*", "", raw, flags=re.IGNORECASE)
+    clean = re.sub(r"\bKanban\b\s*[—:-]?\s*", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\bt_[0-9a-fA-F]{4,}\b\s*[—:-]?\s*", "", clean)
+    clean = re.sub(r"\b(task|card|worker|thread)\b\s*[—:-]?\s*", "", clean, flags=re.IGNORECASE)
+    clean = _compact_text(clean, 160)
+
+    ref = ""
+    m_ref = re.search(r"\b(PR|MR)\s*#\s*(\d+)\b|#(\d+)\b", clean, flags=re.IGNORECASE)
+    if m_ref:
+        if m_ref.group(1):
+            ref = f"{m_ref.group(1).upper()} #{m_ref.group(2)}"
+        else:
+            ref = f"#{m_ref.group(3)}"
+        clean = _compact_text((clean[:m_ref.start()] + clean[m_ref.end():]), 160)
+
+    lowered = raw.lower()
+    if re.search(r"\b(review|revis|pronto review)\b", lowered):
+        action = "Review"
+    elif re.search(r"\b(unblock|sbloc|blocked|blocco)\b", lowered):
+        action = "Unblock"
+    elif re.search(r"\b(fix|bug|errore|hotfix|ripara|risol)\b", lowered):
+        action = "Fix"
+    elif re.search(r"\b(plan|piano|planner|scope|learn)\b", lowered):
+        action = "Plan"
+    else:
+        action = "Task"
+
+    # Drop generic implementation chatter from the summary; Discord thread
+    # names should say the outcome, not enumerate touched layers.
+    clean = re.split(r"\b(?:by touching|con dettagli|detailed|using|via)\b", clean, maxsplit=1, flags=re.IGNORECASE)[0]
+    clean = re.sub(r"\b(?:fix|review|unblock|plan|task)\b", "", clean, flags=re.IGNORECASE)
+    if ref:
+        clean = clean.replace(ref, "")
+    clean = _compact_text(clean.strip(" -—:·"), 80) or "work"
+
+    prefix = f"{action} {ref}" if ref else action
+    suffix = f" · {short_tid}" if short_tid else ""
+    max_summary = max(12, 80 - len(prefix) - len(" — ") - len(suffix))
+    return f"{prefix} — {_compact_text(clean, max_summary)}{suffix}"
+
+
+def _format_kanban_notification(
+    sub: dict,
+    task: Any,
+    ev: Any,
+    *,
+    mode: Optional[str] = None,
+) -> Optional[str]:
+    """Format one Kanban event for chat using the balanced notification style."""
+    kind = getattr(ev, "kind", None)
+    if kind not in _kanban_notifier_event_kinds(mode):
+        return None
+
+    task_id = sub.get("task_id") if isinstance(sub, dict) else None
+    task_id = task_id or getattr(task, "id", None)
+    short_id = _kanban_short_id(task_id)
+    title = _compact_text(getattr(task, "title", None) or task_id or "task", 96)
+    payload = getattr(ev, "payload", None) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    if kind == "completed":
+        raw_summary = payload.get("summary") or getattr(task, "result", "")
+        summary_line = str(raw_summary or "").strip().splitlines()[0] if raw_summary else ""
+        summary = _compact_text(summary_line, 160)
+        return f"✅ Done · {short_id} — {title}" + (f"\n{summary}" if summary else "")
+    if kind == "blocked":
+        reason = _compact_text(payload.get("reason"), 140)
+        return f"⏸ Blocked · {short_id}" + (f" — {reason}" if reason else f" — {title}")
+    if kind == "gave_up":
+        err = _compact_text(payload.get("error"), 160)
+        trigger = _compact_text(payload.get("trigger_outcome"), 40)
+        if trigger == "timed_out":
+            reason = "retry limit reached after timeouts"
+        elif trigger == "crashed":
+            reason = "retry limit reached after crashes"
+        elif trigger == "spawn_failed":
+            reason = "worker could not start after retries"
+        else:
+            reason = "retry limit reached"
+        return f"✖ Needs review · {short_id} — {reason}" + (f"\n{err}" if err else "")
+    if kind == "crashed":
+        return f"✖ Crashed · {short_id} — retrying"
+    if kind == "timed_out":
+        limit = payload.get("limit_seconds")
+        suffix = f" after {int(limit)}s" if limit else ""
+        return f"⏱ Timed out · {short_id}{suffix} — retrying"
+    return None
+
+
 # Only auto-continue interrupted gateway turns while the interruption is fresh.
 # Stale tool-tail/resume markers can otherwise revive an unrelated old task
 # after a gateway restart when the user's next message starts new work.
@@ -3717,9 +3853,10 @@ class GatewayRunner:
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
 
-        # Start background kanban notifier — delivers `completed`, `blocked`,
-        # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
-        # so human-in-the-loop workflows hear back without polling.
+        # Start background kanban notifier — delivers milestone events to
+        # gateway subscribers so human-in-the-loop workflows hear back
+        # without polling. The exact event set depends on the notifier mode
+        # (balanced by default, verbose for retry-loop debugging).
         asyncio.create_task(self._kanban_notifier_watcher())
 
         # Start background kanban dispatcher — spawns workers for ready
@@ -3837,7 +3974,10 @@ class GatewayRunner:
         # (no permission, topics-mode off, parent is a DM, etc.). When
         # None we fall through to using the home channel directly — the
         # synthetic turn still lands; just without thread isolation.
-        thread_name = f"Hermes — {cli_title}"
+        if re.search(r"\bKanban\b|\bt_[0-9a-fA-F]{4,}\b", str(cli_title), re.IGNORECASE):
+            thread_name = _kanban_balanced_thread_name(cli_title)
+        else:
+            thread_name = f"Hermes — {cli_title}"
         try:
             new_thread_id = await adapter.create_handoff_thread(
                 str(home.chat_id), thread_name,
@@ -4139,11 +4279,13 @@ class GatewayRunner:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
-        message per new event to ``(platform, chat_id, thread_id)``,
-        then advances the cursor. When a task reaches a terminal state
-        (``completed`` / ``archived``), the subscription is removed.
+        stored cursor with kind in the notifier profile's event set. Balanced
+        mode sends durable milestones (``completed``, ``blocked``,
+        ``gave_up``); verbose mode also surfaces retry-loop internals
+        (``crashed``, ``timed_out``). Sends one message per new event to
+        ``(platform, chat_id, thread_id)``, then advances the cursor. When a
+        task reaches a terminal state (``completed`` / ``archived``), the
+        subscription is removed.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
@@ -4161,7 +4303,7 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        TERMINAL_KINDS = _kanban_notifier_event_kinds()
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -4172,8 +4314,9 @@ class GatewayRunner:
         # Same shape as the reblock-after-unblock cycle that PR #22941
         # fixed for `blocked`. Keeping the subscription alive until the
         # task is genuinely done lets the cursor (advanced atomically by
-        # claim_unseen_events_for_sub) handle dedup, and any retry-loop
-        # event reaches the user.
+        # claim_unseen_events_for_sub) handle dedup. In verbose mode this
+        # can surface every retry-loop event; in balanced mode those internals
+        # remain in Kanban logs while the subscription stays alive.
         # Per-subscription send-failure counter. Adapter.send raising
         # means the chat is dead (deleted, bot kicked, etc.) — after N
         # consecutive send failures the sub is dropped so we don't spin
@@ -4319,61 +4462,10 @@ class GatewayRunner:
                             board_slug,
                         )
                         continue
-                    title = (task.title if task else sub["task_id"])[:120]
                     for ev in d["events"]:
                         kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
-                        if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
-                            payload_summary = None
-                            if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                h = payload_summary.strip().splitlines()[0][:200]
-                                handoff = f"\n{h}"
-                            elif task and task.result:
-                                r = task.result.strip().splitlines()[0][:160]
-                                handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
-                        elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
-                        elif kind == "crashed":
-                            msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
-                            )
-                        elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
-                        else:
+                        msg = _format_kanban_notification(sub, task, ev)
+                        if not msg:
                             continue
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):

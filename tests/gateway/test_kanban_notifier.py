@@ -4,8 +4,86 @@ from pathlib import Path
 import pytest
 
 from gateway.config import Platform
-from gateway.run import GatewayRunner
+from gateway.run import (
+    GatewayRunner,
+    _format_kanban_notification,
+    _kanban_balanced_thread_name,
+    _kanban_notifier_event_kinds,
+)
 from hermes_cli import kanban_db as kb
+
+
+def test_balanced_thread_name_is_outcome_first_and_scannable():
+    title = (
+        "Hermes — Kanban t_2106abcd: fix PR #78 search/listing by touching "
+        "backend filters, frontend cards, SQL migrations, and detailed worker logs"
+    )
+
+    thread_name = _kanban_balanced_thread_name(title)
+
+    assert thread_name.startswith("Fix PR #78 — search/listing")
+    assert thread_name.endswith("· t_2106")
+    assert "Hermes" not in thread_name
+    assert "Kanban" not in thread_name
+    assert "SQL migrations" not in thread_name
+    assert len(thread_name) <= 80
+
+
+def test_balanced_default_filters_retry_chatter(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_NOTIFIER_MODE", raising=False)
+
+    assert _kanban_notifier_event_kinds() == ("completed", "blocked", "gave_up")
+
+
+def test_verbose_mode_keeps_retry_chatter_for_debugging(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFIER_MODE", "verbose")
+
+    assert _kanban_notifier_event_kinds() == (
+        "completed", "blocked", "gave_up", "crashed", "timed_out"
+    )
+
+
+def test_balanced_completed_message_is_compact_and_user_facing():
+    task = type("Task", (), {
+        "id": "t_abcd1234",
+        "title": "Implementare un refactor molto dettagliato con log tecnici interni",
+        "assignee": "worker",
+        "result": "Fallback result should not win",
+    })()
+    ev = type("Event", (), {
+        "kind": "completed",
+        "payload": {"summary": "Diff pronto, test mirati verdi, nessun restart live.\nDettagli tecnici lunghi"},
+    })()
+
+    msg = _format_kanban_notification(
+        {"task_id": "t_abcd1234"}, task, ev, mode="balanced"
+    )
+
+    assert msg == (
+        "✅ Done · t_abcd — Implementare un refactor molto dettagliato con log tecnici interni\n"
+        "Diff pronto, test mirati verdi, nessun restart live."
+    )
+    assert "@worker" not in msg
+    assert "Kanban" not in msg
+    assert "Dettagli tecnici" not in msg
+
+
+def test_gave_up_message_reflects_trigger_outcome():
+    task = type("Task", (), {"id": "t_deadbeef", "title": "Long retrying task"})()
+    ev = type("Event", (), {
+        "kind": "gave_up",
+        "payload": {"trigger_outcome": "timed_out", "error": "Exceeded retry threshold"},
+    })()
+
+    msg = _format_kanban_notification(
+        {"task_id": "t_deadbeef"}, task, ev, mode="balanced"
+    )
+
+    assert msg == (
+        "✖ Needs review · t_dead — retry limit reached after timeouts\n"
+        "Exceeded retry threshold"
+    )
+    assert "could not start" not in msg
 
 
 class RecordingAdapter:
@@ -85,8 +163,7 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
-    assert "Kanban" in adapter.sent[0]["text"]
-    assert tid in adapter.sent[0]["text"]
+    assert tid[:6] in adapter.sent[0]["text"]
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
@@ -175,7 +252,7 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
-    """A retry cycle (crashed → reclaimed → crashed) notifies the user twice.
+    """Verbose mode can still surface every retry-cycle crash for debugging.
 
     Before #21398 the notifier auto-unsubscribed on any terminal event kind
     (gave_up / crashed / timed_out), so the second crash in a respawn cycle
@@ -186,6 +263,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     Two crashes ten seconds apart on the same task — both should land on
     the adapter.
     """
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFIER_MODE", "verbose")
     db_path = tmp_path / "redeliver-cycle.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
