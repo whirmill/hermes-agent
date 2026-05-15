@@ -75,7 +75,7 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ["gave_up", "crashed", "timed_out"])
-async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
+async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home, monkeypatch):
     """
     Event kinds gave_up / crashed / timed_out send a notification but DO
     NOT delete the subscription. The dispatcher may respawn the task and
@@ -88,6 +88,11 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     import hermes_cli.kanban_db as kb
     from gateway.run import GatewayRunner
     from gateway.config import Platform
+
+    # Balanced default only emits durable milestones. Retry-loop events remain
+    # available in the explicit verbose profile.
+    if kind in {"crashed", "timed_out"}:
+        monkeypatch.setenv("HERMES_KANBAN_NOTIFIER_MODE", "verbose")
 
     conn = kb.connect()
 
@@ -123,7 +128,11 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
     # The user is notified about the abnormal event...
     fake_adapter.send.assert_called_once()
-    assert kind.replace('_', ' ') in fake_adapter.send.call_args[0][1]
+    msg = fake_adapter.send.call_args[0][1].lower()
+    if kind == "gave_up":
+        assert "needs review" in msg or "retry limit" in msg
+    else:
+        assert kind.replace('_', ' ') in msg
 
     # ...but the subscription survives so a respawn-then-same-event cycle
     # reaches the user too. The cursor (last_event_id) advanced inside
@@ -209,7 +218,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
             timeout=10.0,
         )
 
-    blocked_deliveries = [m for m in delivered_msgs if "blocked" in m]
+    blocked_deliveries = [m for m in delivered_msgs if "blocked" in m.lower()]
     assert "second block" not in blocked_deliveries[0]
     assert "second block" in blocked_deliveries[1]
     assert len(blocked_deliveries) == 2, (
