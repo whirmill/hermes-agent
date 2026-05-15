@@ -317,6 +317,7 @@ class TestBuiltinDiscovery:
             "tools.terminal_tool",
             "tools.todo_tool",
             "tools.tts_tool",
+            "tools.video_generation_tool",
             "tools.vision_tools",
             "tools.web_tools",
             "tools.yuanbao_tools",

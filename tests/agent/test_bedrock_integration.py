@@ -263,10 +263,10 @@ class TestPackaging:
         content = toml_path.read_text()
         assert 'bedrock = ["boto3' in content
 
-    def test_bedrock_in_all_extra(self):
-        from pathlib import Path
-        content = (Path(__file__).parent.parent.parent / "pyproject.toml").read_text()
-        assert '"hermes-agent[bedrock]"' in content
+    def test_bedrock_lazy_dep_exists(self):
+        from tools.lazy_deps import feature_specs
+
+        assert feature_specs("provider.bedrock") == ("boto3==1.42.89",)
 
 
 # ---------------------------------------------------------------------------

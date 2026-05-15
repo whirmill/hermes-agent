@@ -7,13 +7,19 @@ from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
 
 def _compressor() -> ContextCompressor:
     with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-        return ContextCompressor(
+        compressor = ContextCompressor(
             model="test/model",
             threshold_percent=0.85,
-            protect_first_n=1,
+            # Protect only the system prompt so the persisted handoff message is
+            # inside the compaction window and can rehydrate _previous_summary.
+            protect_first_n=0,
             protect_last_n=1,
             quiet_mode=True,
         )
+    # Force a tiny protected-tail budget so this focused regression keeps
+    # exercising the summarizer path even after token-budget tail protection.
+    compressor.tail_token_budget = 1
+    return compressor
 
 
 def _response(content: str):
