@@ -1637,7 +1637,17 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        body_clean = body.strip()
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {
+                "author": author.strip(),
+                "len": len(body_clean),
+                "body_preview": body_clean.splitlines()[0][:400],
+            },
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -4416,6 +4426,63 @@ def remove_notify_sub(
             (task_id, platform, chat_id, thread_id or ""),
         )
     return cur.rowcount > 0
+
+
+def move_notify_sub_thread(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    old_thread_id: Optional[str],
+    new_thread_id: str,
+) -> bool:
+    """Move a notification subscription from a channel row into a thread row.
+
+    ``thread_id`` is part of the subscription primary key. Discord channel
+    subscriptions start with an empty thread id, then the gateway creates a
+    per-task activity thread when the first visible event is claimed. Moving
+    the row instead of inserting a second row preserves the cursor and avoids
+    duplicate deliveries to both the parent channel and the thread.
+    """
+    old_thread = old_thread_id or ""
+    new_thread = str(new_thread_id or "")
+    if not new_thread or old_thread == new_thread:
+        return False
+    with write_txn(conn):
+        source = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, old_thread),
+        ).fetchone()
+        if source is None:
+            return False
+        source_cursor = int(source["last_event_id"] or 0)
+        target = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, new_thread),
+        ).fetchone()
+        if target is not None:
+            target_cursor = int(target["last_event_id"] or 0)
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id = ? WHERE task_id = ? "
+                "AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (max(source_cursor, target_cursor), task_id, platform, chat_id, new_thread),
+            )
+            conn.execute(
+                "DELETE FROM kanban_notify_subs WHERE task_id = ? "
+                "AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (task_id, platform, chat_id, old_thread),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE kanban_notify_subs SET thread_id = ? WHERE task_id = ? "
+                "AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (new_thread, task_id, platform, chat_id, old_thread),
+            )
+            return cur.rowcount > 0
+    return True
 
 
 def unseen_events_for_sub(

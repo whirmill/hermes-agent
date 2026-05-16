@@ -86,6 +86,156 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
     return _TELEGRAM_COMMAND_MENTION_RE.sub(_replace, text)
 
 
+_KANBAN_BALANCED_EVENT_KINDS = ("completed", "blocked", "gave_up")
+_KANBAN_VERBOSE_EVENT_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+_KANBAN_AUDIT_EVENT_KINDS = (
+    "spawned", "heartbeat", "commented",
+    "completed", "blocked", "gave_up", "crashed", "timed_out",
+)
+
+
+def _compact_text(text: Any, limit: int) -> str:
+    """Collapse whitespace and trim to a human-scannable single line."""
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(1, limit - 1)].rstrip(" ,.;:—-") + "…"
+
+
+def _kanban_short_id(task_id: Any) -> str:
+    tid = str(task_id or "").strip()
+    match = re.search(r"t_[0-9a-fA-F]+", tid)
+    if match:
+        tid = match.group(0)
+    return tid[:8] if tid else "task"
+
+
+def _kanban_notifier_mode(mode: Optional[str] = None) -> str:
+    raw = (mode or os.getenv("HERMES_KANBAN_NOTIFIER_MODE") or "balanced").strip().lower()
+    if raw in {"audit", "operational", "ops", "all"}:
+        return "audit"
+    if raw in {"verbose", "debug", "retry"}:
+        return "verbose"
+    return "balanced"
+
+
+def _kanban_notifier_event_kinds(mode: Optional[str] = None) -> tuple[str, ...]:
+    """Return event kinds worth pushing to chat for the notifier profile.
+
+    ``balanced`` is the default Discord/gateway UX: only durable milestones
+    hit chat. Retry-loop internals remain in Kanban logs unless ``verbose`` is
+    selected. High-volume operational audit events (spawned, heartbeat,
+    commented) require explicit ``audit``/``all`` mode.
+    """
+    profile = _kanban_notifier_mode(mode)
+    if profile == "audit":
+        return _KANBAN_AUDIT_EVENT_KINDS
+    if profile == "verbose":
+        return _KANBAN_VERBOSE_EVENT_KINDS
+    return _KANBAN_BALANCED_EVENT_KINDS
+
+
+def _kanban_balanced_thread_name(title: Any, task_id: Optional[str] = None) -> str:
+    """Build an outcome-first, Discord-scannable Kanban handoff thread title."""
+    raw = _compact_text(title, 240)
+    detected_tid = task_id or ""
+    m_tid = re.search(r"\bt_[0-9a-fA-F]{4,}\b", raw)
+    if m_tid and not detected_tid:
+        detected_tid = m_tid.group(0)
+    short_tid = _kanban_short_id(detected_tid) if detected_tid else ""
+
+    clean = re.sub(r"\bHermes\b\s*[—:-]?\s*", "", raw, flags=re.IGNORECASE)
+    clean = re.sub(r"\bKanban\b\s*[—:-]?\s*", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\bt_[0-9a-fA-F]{4,}\b\s*[—:-]?\s*", "", clean)
+    clean = re.sub(r"\b(task|card|worker|thread)\b\s*[—:-]?\s*", "", clean, flags=re.IGNORECASE)
+    clean = _compact_text(clean, 160)
+
+    ref = ""
+    m_ref = re.search(r"\b(PR|MR)\s*#\s*(\d+)\b|#(\d+)\b", clean, flags=re.IGNORECASE)
+    if m_ref:
+        if m_ref.group(1):
+            ref = f"{m_ref.group(1).upper()} #{m_ref.group(2)}"
+        else:
+            ref = f"#{m_ref.group(3)}"
+        clean = _compact_text((clean[:m_ref.start()] + clean[m_ref.end():]), 160)
+
+    lowered = raw.lower()
+    if re.search(r"\b(review|revis|pronto review)\b", lowered):
+        action = "Review"
+    elif re.search(r"\b(unblock|sbloc|blocked|blocco)\b", lowered):
+        action = "Unblock"
+    elif re.search(r"\b(fix|bug|errore|hotfix|ripara|risol)\b", lowered):
+        action = "Fix"
+    elif re.search(r"\b(plan|piano|planner|scope|learn)\b", lowered):
+        action = "Plan"
+    else:
+        action = "Task"
+
+    clean = re.split(r"\b(?:by touching|con dettagli|detailed|using|via)\b", clean, maxsplit=1, flags=re.IGNORECASE)[0]
+    clean = re.sub(r"\b(?:fix|review|unblock|plan|task)\b", "", clean, flags=re.IGNORECASE)
+    if ref:
+        clean = clean.replace(ref, "")
+    clean = _compact_text(clean.strip(" -—:·"), 80) or "work"
+
+    prefix = f"{action} {ref}" if ref else action
+    suffix = f" · {short_tid}" if short_tid else ""
+    max_summary = max(12, 80 - len(prefix) - len(" — ") - len(suffix))
+    return f"{prefix} — {_compact_text(clean, max_summary)}{suffix}"[:80]
+
+
+def _format_kanban_notification(
+    sub: dict,
+    task: Any,
+    ev: Any,
+    *,
+    mode: Optional[str] = None,
+) -> Optional[str]:
+    """Format one Kanban event for chat using the balanced notification style."""
+    kind = getattr(ev, "kind", None)
+    if kind not in _kanban_notifier_event_kinds(mode):
+        return None
+
+    task_id = sub.get("task_id") if isinstance(sub, dict) else None
+    task_id = task_id or getattr(task, "id", None)
+    short_id = _kanban_short_id(task_id)
+    title = _compact_text(getattr(task, "title", None) or task_id or "task", 96)
+    payload = getattr(ev, "payload", None) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    if kind == "completed":
+        raw_summary = payload.get("summary") or getattr(task, "result", "")
+        summary_line = str(raw_summary or "").strip().splitlines()[0] if raw_summary else ""
+        summary = _compact_text(summary_line, 160)
+        return f"✅ Done · {short_id} — {title}" + (f"\n{summary}" if summary else "")
+    if kind == "blocked":
+        reason = _compact_text(payload.get("reason"), 140)
+        return f"⏸ Blocked · {short_id}" + (f" — {reason}" if reason else f" — {title}")
+    if kind == "gave_up":
+        err = _compact_text(payload.get("error"), 160)
+        trigger = _compact_text(payload.get("trigger_outcome"), 40)
+        if trigger == "timed_out":
+            reason = "retry limit reached after timeouts"
+        elif trigger == "crashed":
+            reason = "retry limit reached after crashes"
+        elif trigger == "spawn_failed":
+            reason = "worker could not start after retries"
+        else:
+            reason = "retry limit reached"
+        return f"✖ Needs review · {short_id} — {reason}" + (f"\n{err}" if err else "")
+    if kind == "crashed":
+        return f"✖ Crashed · {short_id} — retrying"
+    if kind == "timed_out":
+        limit = payload.get("limit_seconds")
+        try:
+            limit_s = int(limit) if limit else 0
+        except (TypeError, ValueError):
+            limit_s = 0
+        suffix = f" after {limit_s}s" if limit_s else ""
+        return f"⏱ Timed out · {short_id}{suffix} — retrying"
+    return None
+
+
 # Only auto-continue interrupted gateway turns while the interruption is fresh.
 # Stale tool-tail/resume markers can otherwise revive an unrelated old task
 # after a gateway restart when the user's next message starts new work.
@@ -3801,9 +3951,10 @@ class GatewayRunner:
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
 
-        # Start background kanban notifier — delivers `completed`, `blocked`,
-        # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
-        # so human-in-the-loop workflows hear back without polling.
+        # Start background kanban notifier. The default balanced profile only
+        # pushes durable milestones (`completed`, `blocked`, `gave_up`) to
+        # chat; retry chatter and full operational audit require explicit
+        # verbose/audit modes.
         asyncio.create_task(self._kanban_notifier_watcher())
 
         # Start background kanban dispatcher — spawns workers for ready
@@ -3921,7 +4072,10 @@ class GatewayRunner:
         # (no permission, topics-mode off, parent is a DM, etc.). When
         # None we fall through to using the home channel directly — the
         # synthetic turn still lands; just without thread isolation.
-        thread_name = f"Hermes — {cli_title}"
+        if re.search(r"\bKanban\b|\bt_[0-9a-fA-F]{4,}\b", str(cli_title), re.IGNORECASE):
+            thread_name = _kanban_balanced_thread_name(cli_title)
+        else:
+            thread_name = f"Hermes — {cli_title}"
         try:
             new_thread_id = await adapter.create_handoff_thread(
                 str(home.chat_id), thread_name,
@@ -4220,14 +4374,16 @@ class GatewayRunner:
             return "default"
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
-        """Poll ``kanban_notify_subs`` and deliver terminal events to users.
+        """Poll ``kanban_notify_subs`` and deliver task progress to users.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
-        message per new event to ``(platform, chat_id, thread_id)``,
-        then advances the cursor. When a task reaches a terminal state
-        (``completed`` / ``archived``), the subscription is removed.
+        stored cursor with kind in the progress/terminal set. Sends one
+        concise operational message per user-visible event to
+        ``(platform, chat_id, thread_id)``, then advances the cursor. When
+        a task reaches a final state (``completed`` / ``archived``), the
+        subscription is removed. The messages intentionally expose an
+        operational audit trail (spawn, heartbeat/comment milestones,
+        final handoff) rather than private chain-of-thought.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
@@ -4245,7 +4401,7 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        NOTIFY_KINDS = _kanban_notifier_event_kinds()
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -4353,11 +4509,21 @@ class GatewayRunner:
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=NOTIFY_KINDS,
                                 )
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                runs: dict[int, Any] = {}
+                                for ev in events:
+                                    if ev.run_id is None:
+                                        continue
+                                    try:
+                                        run = _kb.get_run(conn, int(ev.run_id))
+                                    except Exception:
+                                        run = None
+                                    if run is not None:
+                                        runs[int(ev.run_id)] = run
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -4368,6 +4534,7 @@ class GatewayRunner:
                                     "cursor": cursor,
                                     "events": events,
                                     "task": task,
+                                    "runs": runs,
                                     "board": slug,
                                 })
                         finally:
@@ -4403,61 +4570,32 @@ class GatewayRunner:
                             board_slug,
                         )
                         continue
-                    title = (task.title if task else sub["task_id"])[:120]
+                    if not sub.get("thread_id") and platform_str == "discord":
+                        new_thread_id = await self._kanban_ensure_activity_thread(
+                            adapter=adapter,
+                            sub=sub,
+                            task=task,
+                            board=board_slug,
+                        )
+                        if new_thread_id:
+                            sub = dict(sub)
+                            sub["thread_id"] = new_thread_id
+                            d["sub"] = sub
+                        else:
+                            logger.warning(
+                                "kanban notifier: could not create/move Discord activity thread for %s on board %s; falling back to parent channel",
+                                sub["task_id"], board_slug,
+                            )
                     for ev in d["events"]:
                         kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
-                        if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
-                            payload_summary = None
-                            if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                h = payload_summary.strip().splitlines()[0][:200]
-                                handoff = f"\n{h}"
-                            elif task and task.result:
-                                r = task.result.strip().splitlines()[0][:160]
-                                handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
-                        elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
-                        elif kind == "crashed":
-                            msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
-                            )
-                        elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
-                        else:
+                        msg = self._kanban_render_notification(
+                            sub=sub,
+                            task=task,
+                            event=ev,
+                            board=board_slug,
+                            run=(d.get("runs") or {}).get(int(ev.run_id)) if ev.run_id is not None else None,
+                        )
+                        if not msg:
                             continue
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
@@ -4517,7 +4655,7 @@ class GatewayRunner:
                         # gave_up / crashed / timed_out the subscription is
                         # kept alive so the user gets notified again if the
                         # dispatcher respawns the task and it cycles into the
-                        # same state. See the longer comment on TERMINAL_KINDS
+                        # same state. See the longer comment on NOTIFY_KINDS
                         # above for the failure mode this prevents.
                         task_terminal = task and task.status in {"done", "archived"}
                         if task_terminal:
@@ -4531,6 +4669,318 @@ class GatewayRunner:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    @staticmethod
+    def _kanban_preview(value: Any, limit: int = 240) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)].rstrip() + "…"
+
+    @staticmethod
+    def _kanban_tag(task: Any) -> str:
+        who = getattr(task, "assignee", None) if task else None
+        return f"@{who} " if who else ""
+
+    @staticmethod
+    def _kanban_commands(task_id: str, board: Optional[str]) -> str:
+        board_arg = shlex.quote(str(board or "default"))
+        task_arg = shlex.quote(str(task_id))
+        prefix = f"hermes kanban --board {board_arg}"
+        return (
+            "**Dettaglio completo:**\n"
+            f"`{prefix} show {task_arg}`\n"
+            f"`{prefix} tail {task_arg}`\n"
+            f"`{prefix} log {task_arg} --tail 20000`\n"
+            f"`{prefix} runs {task_arg}`"
+        )
+
+    @classmethod
+    def _kanban_acceptance_criteria(cls, task: Any) -> list[str]:
+        body = (getattr(task, "body", None) if task else None) or ""
+        lines = body.splitlines()
+        criteria: list[str] = []
+        collecting = False
+        heading = re.compile(
+            r"^\s*(?:#{1,6}\s*)?(?:acceptance\s+criteria|criteri\s+di\s+accettazione|criteri|ac)\s*:?\s*(.*)$",
+            re.IGNORECASE,
+        )
+        generic_heading = re.compile(r"^\s*(?:#{1,6}\s+|[A-Z][A-Za-z0-9 _/-]{2,}:\s*$)")
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                if collecting and criteria:
+                    break
+                continue
+            match = heading.match(line)
+            if match:
+                collecting = True
+                tail = match.group(1).strip()
+                if tail:
+                    criteria.append(cls._kanban_preview(tail.lstrip("-–—*•[] xX"), 160))
+                continue
+            if collecting:
+                if generic_heading.match(line) and not line.startswith(('-', '*', '•', '☐', '[', '1.')):
+                    break
+                criteria.append(cls._kanban_preview(line.lstrip("-–—*•[] xX"), 160))
+                if len(criteria) >= 5:
+                    break
+        if not criteria:
+            for raw in lines:
+                line = raw.strip()
+                if re.match(r"^[-*]\s+\[[ xX]\]\s+", line):
+                    criteria.append(cls._kanban_preview(re.sub(r"^[-*]\s+\[[ xX]\]\s+", "", line), 160))
+                if len(criteria) >= 5:
+                    break
+        return [c for c in criteria if c]
+
+    @classmethod
+    def _kanban_objective(cls, task: Any, task_id: str) -> str:
+        title = cls._kanban_preview(getattr(task, "title", None) or task_id, 140)
+        body = (getattr(task, "body", None) if task else None) or ""
+        extra = ""
+        for raw in body.splitlines():
+            line = raw.strip()
+            if not line or line.startswith(("#", "- [", "* [")):
+                continue
+            if line.lower().startswith(("acceptance criteria", "criteri", "ac:")):
+                continue
+            extra = cls._kanban_preview(line, 220)
+            break
+        if extra and extra.lower() != title.lower():
+            return cls._kanban_preview(f"{title} — {extra}", 320)
+        return title
+
+    @staticmethod
+    def _kanban_workspace(task: Any) -> str:
+        if not task:
+            return "—"
+        path = getattr(task, "workspace_path", None) or ""
+        kind = getattr(task, "workspace_kind", None) or "workspace"
+        return path or kind or "—"
+
+    @classmethod
+    def _kanban_run_audit(cls, run: Any) -> str:
+        meta = getattr(run, "metadata", None) if run else None
+        if not isinstance(meta, dict):
+            return ""
+        parts: list[str] = []
+        changed = meta.get("changed_files") or meta.get("files")
+        if isinstance(changed, list) and changed:
+            shown = ", ".join(str(p) for p in changed[:5])
+            if len(changed) > 5:
+                shown += f", +{len(changed) - 5}"
+            parts.append(f"file: {shown}")
+        tests = meta.get("tests_run") or meta.get("tests")
+        if tests:
+            if isinstance(tests, list):
+                shown = ", ".join(str(t) for t in tests[:4])
+                if len(tests) > 4:
+                    shown += f", +{len(tests) - 4}"
+                parts.append(f"test: {shown}")
+            else:
+                parts.append(f"test: {cls._kanban_preview(tests, 140)}")
+        diff_path = meta.get("diff_path")
+        if diff_path:
+            parts.append(f"diff: {diff_path}")
+        decisions = meta.get("decisions")
+        if isinstance(decisions, list) and decisions:
+            parts.append("decisioni: " + "; ".join(cls._kanban_preview(d, 100) for d in decisions[:3]))
+        return "\n**Audit operativo:** " + " • ".join(parts) if parts else ""
+
+    def _kanban_render_notification(
+        self,
+        *,
+        sub: dict,
+        task: Any,
+        event: Any,
+        board: Optional[str],
+        run: Any = None,
+    ) -> Optional[str]:
+        task_id = str(sub.get("task_id") or getattr(event, "task_id", "") or "")
+        title = self._kanban_preview(getattr(task, "title", None) or task_id, 120)
+        tag = self._kanban_tag(task)
+        payload = getattr(event, "payload", None) or {}
+        kind = getattr(event, "kind", "")
+        mode = _kanban_notifier_mode()
+        if mode != "audit":
+            return _format_kanban_notification(sub, task, event, mode=mode)
+
+        if kind == "spawned":
+            pid = payload.get("pid") if isinstance(payload, dict) else None
+            criteria = self._kanban_acceptance_criteria(task)
+            criteria_text = "\n".join(f"- {c}" for c in criteria) if criteria else "—"
+            pid_text = f" (pid {pid})" if pid else ""
+            return (
+                f"▶ {tag}Kanban {task_id} avviato{pid_text} — {title}\n"
+                f"**Obiettivo:** {self._kanban_objective(task, task_id)}\n"
+                f"**Assignee:** {getattr(task, 'assignee', None) or '—'}\n"
+                f"**Repo/workspace:** {self._kanban_workspace(task)}\n"
+                f"**Acceptance criteria:**\n{criteria_text}\n"
+                "**Audit operativo:** aggiornerò questo thread solo con milestone operative "
+                "(stage/heartbeat/commenti e handoff finale), senza chain-of-thought privata.\n"
+                f"{self._kanban_commands(task_id, board)}"
+            )
+        if kind == "heartbeat":
+            note = payload.get("note") if isinstance(payload, dict) else None
+            note = self._kanban_preview(note, 260)
+            if not note:
+                return None
+            board_arg = shlex.quote(str(board or "default"))
+            task_arg = shlex.quote(task_id)
+            return (
+                f"🛠 {tag}Kanban {task_id} stage — {note}\n"
+                f"Dettaglio: `hermes kanban --board {board_arg} tail {task_arg}`"
+            )
+        if kind == "commented":
+            author = payload.get("author") if isinstance(payload, dict) else None
+            if isinstance(payload, dict):
+                body = payload.get("body_preview") or payload.get("body")
+            else:
+                body = None
+            body = self._kanban_preview(body, 260)
+            if body:
+                return f"💬 {tag}Kanban {task_id} update ({author or 'comment'}): {body}"
+            return f"💬 {tag}Kanban {task_id}: commento operativo aggiunto"
+        if kind == "completed":
+            handoff = ""
+            payload_summary = payload.get("summary") if isinstance(payload, dict) else None
+            run_summary = getattr(run, "summary", None) if run else None
+            if payload_summary:
+                handoff = f"\n{self._kanban_preview(payload_summary, 260)}"
+            elif run_summary:
+                handoff = f"\n{self._kanban_preview(run_summary, 260)}"
+            elif task and getattr(task, "result", None):
+                handoff = f"\n{self._kanban_preview(task.result, 220)}"
+            return (
+                f"✔ {tag}Kanban {task_id} done — {title}{handoff}"
+                f"{self._kanban_run_audit(run)}\n{self._kanban_commands(task_id, board)}"
+            )
+        if kind == "blocked":
+            reason = ""
+            if isinstance(payload, dict) and payload.get("reason"):
+                reason = f": {self._kanban_preview(payload['reason'], 220)}"
+            return f"⏸ {tag}Kanban {task_id} blocked{reason}\n{self._kanban_commands(task_id, board)}"
+        if kind == "gave_up":
+            err = ""
+            if isinstance(payload, dict) and payload.get("error"):
+                err = f"\n{self._kanban_preview(payload['error'], 260)}"
+            return (
+                f"✖ {tag}Kanban {task_id} gave up after repeated worker failures{err}\n"
+                f"{self._kanban_commands(task_id, board)}"
+            )
+        if kind == "crashed":
+            pid = payload.get("pid") if isinstance(payload, dict) else None
+            pid_text = f" (pid {pid})" if pid else ""
+            return (
+                f"✖ {tag}Kanban {task_id} worker crashed{pid_text}; dispatcher will retry\n"
+                f"{self._kanban_commands(task_id, board)}"
+            )
+        if kind == "timed_out":
+            limit = 0
+            if isinstance(payload, dict) and payload.get("limit_seconds"):
+                try:
+                    limit = int(payload["limit_seconds"])
+                except Exception:
+                    limit = 0
+            return (
+                f"⏱ {tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry\n"
+                f"{self._kanban_commands(task_id, board)}"
+            )
+        return None
+
+    async def _kanban_ensure_activity_thread(
+        self,
+        *,
+        adapter: Any,
+        sub: dict,
+        task: Any,
+        board: Optional[str],
+    ) -> Optional[str]:
+        """Create a Discord per-task activity thread and move the sub row.
+
+        Portfolio/Kanban subscriptions are intentionally registered against
+        project root channels so they survive task creation before a thread
+        exists. On the first claimed Discord event, create the thread, move the
+        subscription row (preserving its cursor), and send all following
+        notifications into the thread instead of the noisy parent channel.
+        """
+        create_handoff = getattr(adapter, "create_handoff_thread", None)
+        if not callable(create_handoff):
+            return None
+
+        task_id = str(sub.get("task_id") or "")
+        title = self._kanban_preview(getattr(task, "title", None) or task_id, 54)
+        board_name = str(board or "default")
+        thread_name = _kanban_balanced_thread_name(title, task_id=task_id)
+        user_id = str(sub.get("user_id") or "").strip()
+        kwargs: dict[str, Any] = {}
+        try:
+            if "user_ids" in inspect.signature(create_handoff).parameters and user_id:
+                kwargs["user_ids"] = [user_id]
+        except (TypeError, ValueError):
+            if user_id:
+                kwargs["user_ids"] = [user_id]
+
+        try:
+            result = create_handoff(str(sub.get("chat_id") or ""), thread_name, **kwargs)
+            new_thread_id = await result if inspect.isawaitable(result) else result
+        except TypeError:
+            # Older/non-Discord adapters may not accept user_ids even if the
+            # signature is opaque; retry the minimal call before giving up.
+            try:
+                result = create_handoff(str(sub.get("chat_id") or ""), thread_name)
+                new_thread_id = await result if inspect.isawaitable(result) else result
+            except Exception as exc:
+                logger.warning(
+                    "kanban notifier: failed to create activity thread for %s on board %s: %s",
+                    task_id, board_name, exc,
+                )
+                return None
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: failed to create activity thread for %s on board %s: %s",
+                task_id, board_name, exc,
+            )
+            return None
+
+        if not new_thread_id:
+            return None
+
+        moved = await asyncio.to_thread(
+            self._kanban_move_sub_thread,
+            sub,
+            str(new_thread_id),
+            board,
+        )
+        if not moved:
+            logger.warning(
+                "kanban notifier: created thread %s for %s but could not move subscription row on board %s",
+                new_thread_id, task_id, board_name,
+            )
+            return None
+        return str(new_thread_id)
+
+    def _kanban_move_sub_thread(
+        self, sub: dict, new_thread_id: str, board: Optional[str] = None,
+    ) -> bool:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            mover = getattr(_kb, "move_notify_sub_thread", None)
+            if callable(mover):
+                return bool(mover(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    old_thread_id=sub.get("thread_id") or "",
+                    new_thread_id=new_thread_id,
+                ))
+            return False
+        finally:
+            conn.close()
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
