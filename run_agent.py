@@ -2675,9 +2675,12 @@ class AIAgent:
         old_model = self.model
         old_provider = self.provider
 
-        # Clear the per-config context_length override so the new model's
-        # actual context window is resolved via get_model_context_length()
-        # instead of inheriting the stale value from the previous model.
+        # Clear the startup/per-config context-length override before the
+        # switch. The compressor refresh below re-reads the live config and
+        # passes only an explicit global model.context_length override for the
+        # new model; per-custom-provider overrides are resolved by
+        # get_model_context_length(custom_providers=...). This prevents a
+        # previous model's per-model override from leaking into the new model.
         self._config_context_length = None
 
         # ── Swap core runtime fields ──
@@ -2755,18 +2758,31 @@ class AIAgent:
             # context_length overrides are honored when switching to a
             # custom provider mid-session (closes #15779).
             _sm_custom_providers = None
+            _sm_config_context_length = None
             try:
                 from hermes_cli.config import load_config, get_compatible_custom_providers
                 _sm_cfg = load_config()
                 _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
+                _sm_model_cfg = _sm_cfg.get("model", {}) if isinstance(_sm_cfg, dict) else {}
+                if isinstance(_sm_model_cfg, dict):
+                    _raw_ctx = _sm_model_cfg.get("context_length")
+                    if _raw_ctx is not None:
+                        try:
+                            _parsed_ctx = int(_raw_ctx)
+                            if _parsed_ctx > 0:
+                                _sm_config_context_length = _parsed_ctx
+                        except (TypeError, ValueError):
+                            _sm_config_context_length = None
             except Exception:
                 _sm_custom_providers = None
+                _sm_config_context_length = None
+            self._config_context_length = _sm_config_context_length
             new_context_length = get_model_context_length(
                 self.model,
                 base_url=self.base_url,
                 api_key=self.api_key,
                 provider=self.provider,
-                config_context_length=getattr(self, "_config_context_length", None),
+                config_context_length=_sm_config_context_length,
                 custom_providers=_sm_custom_providers,
             )
             self.context_compressor.update_model(
@@ -3295,17 +3311,20 @@ class AIAgent:
             aux_base_url = str(getattr(client, "base_url", ""))
             aux_api_key = str(getattr(client, "api_key", ""))
 
-            aux_context = get_model_context_length(
-                aux_model,
-                base_url=aux_base_url,
-                api_key=aux_api_key,
-                config_context_length=getattr(self, "_aux_compression_context_length_config", None),
+            context_length_kwargs = {
+                "base_url": aux_base_url,
+                "api_key": aux_api_key,
+                "config_context_length": getattr(self, "_aux_compression_context_length_config", None),
                 # Each model must be resolved with its own provider so that
                 # provider-specific paths (e.g. Bedrock static table, OpenRouter API)
                 # are invoked for the correct client, not inherited from the main model.
-                provider=(_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(self, "provider", "")),
-                custom_providers=self._custom_providers,
-            )
+                "provider": (_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(self, "provider", "")),
+            }
+            custom_providers = getattr(self, "_custom_providers", None)
+            if custom_providers:
+                context_length_kwargs["custom_providers"] = custom_providers
+
+            aux_context = get_model_context_length(aux_model, **context_length_kwargs)
 
             # Hard floor: the auxiliary compression model must have at least
             # MINIMUM_CONTEXT_LENGTH (64K) tokens of context.  The main model

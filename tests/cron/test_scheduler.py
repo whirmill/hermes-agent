@@ -1261,6 +1261,16 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+
+        # run_job must not leave cron ContextVars explicitly cleared in the
+        # caller context, otherwise legacy CLI/test callers that intentionally
+        # provide HERMES_CRON_AUTO_DELIVER_* via os.environ cannot be read by
+        # get_session_env() afterward.
+        monkeypatch.setenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", "telegram")
+        monkeypatch.setenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "-2002")
+        from gateway.session_context import get_session_env
+        assert get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM") == "telegram"
+        assert get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") == "-2002"
         fake_db.close.assert_called_once()
 
     def test_run_job_clears_stale_auto_delivery_thread_id_between_jobs(self, tmp_path, monkeypatch):

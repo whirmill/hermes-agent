@@ -22,6 +22,7 @@ from unittest.mock import patch, MagicMock
 from agent.model_metadata import (
     CONTEXT_PROBE_TIERS,
     DEFAULT_CONTEXT_LENGTHS,
+    DEFAULT_FALLBACK_CONTEXT,
     _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
@@ -127,6 +128,10 @@ class TestEstimateMessagesTokensRough:
 # =========================================================================
 
 class TestDefaultContextLengths:
+    def test_empty_model_uses_fallback_context(self):
+        assert get_model_context_length("") == DEFAULT_FALLBACK_CONTEXT
+        assert get_model_context_length(None) == DEFAULT_FALLBACK_CONTEXT  # type: ignore[arg-type]
+
     def test_claude_models_context_lengths(self):
         for key, value in DEFAULT_CONTEXT_LENGTHS.items():
             if "claude" not in key:

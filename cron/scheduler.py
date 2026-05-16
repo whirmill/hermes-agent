@@ -1216,7 +1216,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP, _UNSET
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -1636,7 +1636,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
-            _VAR_MAP[_var_name].set("")
+            # Restore cron delivery variables to the pristine "unset" state
+            # after the job.  During the job they are explicitly "" until a
+            # delivery target is resolved so stale os.environ values cannot
+            # influence routing; after the job, _UNSET preserves CLI/test
+            # compatibility for callers that intentionally provide the legacy
+            # env vars.
+            _VAR_MAP[_var_name].set(_UNSET)
         if _session_db:
             try:
                 _session_db.end_session(_cron_session_id, "cron_complete")
