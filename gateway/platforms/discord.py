@@ -4043,6 +4043,63 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    async def send_action_proposal(
+        self,
+        chat_id: str,
+        proposal: Any,
+        metadata: Optional[dict] = None,
+    ) -> SendResult:
+        """Send an interactive action proposal with approve/comment/reject CTAs."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            target_id = chat_id
+            if metadata and metadata.get("thread_id"):
+                target_id = metadata["thread_id"]
+
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+
+            title = str(getattr(proposal, "title", "") or "Action proposal").strip()
+            body = str(getattr(proposal, "body", "") or "").strip()
+            proposal_type = str(getattr(proposal, "proposal_type", "chat_followup") or "chat_followup")
+            intent_key = str(getattr(proposal, "intent_key", "") or "")
+            proposal_id = str(getattr(proposal, "proposal_id", "") or "")
+            expires_at = getattr(proposal, "expires_at", None)
+
+            max_desc = 4088
+            description = body if len(body) <= max_desc else body[: max_desc - 3] + "..."
+            embed = discord.Embed(
+                title=f"🧭 {title}",
+                description=description,
+                color=discord.Color.blurple(),
+            )
+            embed.add_field(name="Tipo", value=proposal_type, inline=True)
+            if intent_key:
+                clean_intent = intent_key if len(intent_key) <= 256 else intent_key[:253] + "..."
+                embed.add_field(name="Intent", value=clean_intent, inline=True)
+            if expires_at:
+                try:
+                    ttl = max(0, int(float(expires_at) - time.time()))
+                    ttl_text = f"{ttl // 3600}h {(ttl % 3600) // 60}m" if ttl >= 3600 else f"{max(1, ttl // 60)}m"
+                    embed.add_field(name="Scade tra", value=ttl_text, inline=True)
+                except Exception:
+                    pass
+            embed.set_footer(text=f"Proposal {proposal_id} — il click registra una decisione; policy/preflight restano attivi")
+
+            view = ActionProposalView(
+                proposal_id=proposal_id,
+                allowed_user_ids=self._allowed_user_ids,
+                allowed_role_ids=self._allowed_role_ids,
+            )
+            msg = await channel.send(embed=embed, view=view)
+            return SendResult(success=True, message_id=str(msg.id))
+        except Exception as e:
+            logger.warning("[%s] send_action_proposal failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
         confirm_id: str, metadata: Optional[dict] = None,
@@ -5128,6 +5185,151 @@ if DISCORD_AVAILABLE:
             self, interaction: discord.Interaction, button: discord.ui.Button,
         ):
             await self._resolve(interaction, "cancel", discord.Color.greyple(), "Cancelled")
+
+        async def on_timeout(self):
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+
+    class ActionProposalView(discord.ui.View):
+        """Three-button view for auditable action proposals.
+
+        Buttons intentionally record human intent only. The gateway queues a
+        follow-up turn that must re-read source state and pass normal
+        policy/preflight before any mutation.
+        """
+
+        def __init__(
+            self,
+            proposal_id: str,
+            allowed_user_ids: set,
+            allowed_role_ids: Optional[set] = None,
+        ):
+            super().__init__(timeout=24 * 60 * 60)
+            self.proposal_id = proposal_id
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+            self.resolved = False
+
+            buttons = [
+                ("✅ Approva", discord.ButtonStyle.green, "approved"),
+                ("✏️ Modifica / commenta", discord.ButtonStyle.secondary, "needs_changes"),
+                ("❌ Rifiuta", discord.ButtonStyle.red, "rejected"),
+            ]
+            for label, style, decision in buttons:
+                button = discord.ui.Button(
+                    label=label,
+                    style=style,
+                    custom_id=f"action_proposal:{proposal_id}:{decision}",
+                )
+                button.callback = self._make_decision_callback(decision, label)
+                self.add_item(button)
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            return _component_check_auth(
+                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            )
+
+        def _make_decision_callback(self, decision: str, label: str):
+            async def _callback(interaction: discord.Interaction):
+                await self._resolve(interaction, decision, label)
+            return _callback
+
+        async def _resolve(
+            self,
+            interaction: discord.Interaction,
+            decision: str,
+            label: str,
+        ) -> None:
+            if self.resolved:
+                await interaction.response.send_message(
+                    "Questa proposta è già stata risolta~", ephemeral=True,
+                )
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "Non sei autorizzato a rispondere a questa proposta~", ephemeral=True,
+                )
+                return
+
+            user = getattr(interaction, "user", None)
+            actor_id = str(getattr(user, "id", "") or "")
+            actor_name = str(getattr(user, "display_name", "") or getattr(user, "name", "") or actor_id)
+
+            try:
+                from tools.action_proposal import (
+                    notify_action_proposal_decision,
+                    resolve_action_proposal,
+                )
+                result = resolve_action_proposal(
+                    self.proposal_id,
+                    decision=decision,
+                    actor_id=actor_id,
+                    actor_name=actor_name,
+                )
+            except Exception as exc:
+                logger.error("Discord action proposal resolve failed: %s", exc, exc_info=True)
+                await interaction.response.send_message(
+                    "Non sono riuscito a registrare la decisione.", ephemeral=True,
+                )
+                return
+
+            if not result.ok:
+                if result.reason in {"expired", "already_resolved"}:
+                    self.resolved = True
+                    for child in self.children:
+                        child.disabled = True
+                    embed = interaction.message.embeds[0] if (
+                        interaction.message and interaction.message.embeds
+                    ) else None
+                    if embed:
+                        embed.color = discord.Color.greyple()
+                        embed.set_footer(text=f"Proposta non più attiva: {result.reason}")
+                    await interaction.response.edit_message(embed=embed, view=self)
+                else:
+                    await interaction.response.send_message(
+                        f"Proposta non risolta: {result.reason}", ephemeral=True,
+                    )
+                return
+
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+
+            color = discord.Color.green()
+            footer_label = "Approvata"
+            if decision == "rejected":
+                color = discord.Color.red()
+                footer_label = "Rifiutata"
+            elif decision == "needs_changes":
+                color = discord.Color.orange()
+                footer_label = "Richiesta modifica/commento"
+
+            embed = interaction.message.embeds[0] if (
+                interaction.message and interaction.message.embeds
+            ) else None
+            if embed:
+                embed.color = color
+                embed.set_footer(text=f"{footer_label} da {actor_name}")
+
+            await interaction.response.edit_message(embed=embed, view=self)
+
+            try:
+                await notify_action_proposal_decision(result.proposal, result.decision or {})
+            except Exception as exc:
+                logger.error(
+                    "Discord action proposal decision callback failed (id=%s): %s",
+                    self.proposal_id,
+                    exc,
+                    exc_info=True,
+                )
+                try:
+                    await interaction.followup.send(
+                        "Decisione registrata, ma non sono riuscito ad accodare il follow-up.",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
 
         async def on_timeout(self):
             self.resolved = True

@@ -1756,6 +1756,20 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
+    async def send_action_proposal(
+        self,
+        chat_id: str,
+        proposal: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a non-blocking action proposal CTA.
+
+        Adapters with native button UIs can override this to render approve /
+        comment / reject controls. The default returns ``Not supported`` so the
+        gateway can fall back to a plain-text proposal.
+        """
+        return SendResult(success=False, error="Not supported")
+
     async def send_clarify(
         self,
         chat_id: str,

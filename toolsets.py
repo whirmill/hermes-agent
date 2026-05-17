@@ -51,7 +51,7 @@ _HERMES_CORE_TOOLS = [
     # Session history search
     "session_search",
     # Clarifying questions
-    "clarify",
+    "clarify", "action_proposal",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
@@ -213,8 +213,8 @@ TOOLSETS = {
     },
     
     "clarify": {
-        "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
-        "tools": ["clarify"],
+        "description": "Ask the user clarifying questions and create auditable action-proposal CTAs",
+        "tools": ["clarify", "action_proposal"],
         "includes": []
     },
     

@@ -1168,6 +1168,7 @@ class AIAgent:
         thinking_callback: callable = None,
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
+        action_proposal_callback: callable = None,
         step_callback: callable = None,
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
@@ -1230,6 +1231,7 @@ class AIAgent:
             tool_progress_callback (callable): Callback function(tool_name, args_preview) for progress notifications
             clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
                 Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
+            action_proposal_callback (callable): Gateway callback for non-blocking interactive action proposals.
             max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
             reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
                 If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
@@ -1393,6 +1395,7 @@ class AIAgent:
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
         self.clarify_callback = clarify_callback
+        self.action_proposal_callback = action_proposal_callback
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
         self.interim_assistant_callback = interim_assistant_callback
@@ -11009,6 +11012,18 @@ class AIAgent:
                 choices=function_args.get("choices"),
                 callback=self.clarify_callback,
             )
+        elif function_name == "action_proposal":
+            from tools.action_proposal import action_proposal_tool as _action_proposal_tool
+            return _action_proposal_tool(
+                title=function_args.get("title", ""),
+                body=function_args.get("body", ""),
+                proposal_type=function_args.get("proposal_type", "chat_followup"),
+                intent_key=function_args.get("intent_key"),
+                payload=function_args.get("payload"),
+                source_snapshot=function_args.get("source_snapshot"),
+                expires_in_seconds=function_args.get("expires_in_seconds", 24 * 60 * 60),
+                callback=self.action_proposal_callback,
+            )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
         else:
@@ -11647,6 +11662,21 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+            elif function_name == "action_proposal":
+                from tools.action_proposal import action_proposal_tool as _action_proposal_tool
+                function_result = _action_proposal_tool(
+                    title=function_args.get("title", ""),
+                    body=function_args.get("body", ""),
+                    proposal_type=function_args.get("proposal_type", "chat_followup"),
+                    intent_key=function_args.get("intent_key"),
+                    payload=function_args.get("payload"),
+                    source_snapshot=function_args.get("source_snapshot"),
+                    expires_in_seconds=function_args.get("expires_in_seconds", 24 * 60 * 60),
+                    callback=self.action_proposal_callback,
+                )
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl('action_proposal', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):

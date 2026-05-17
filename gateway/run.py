@@ -2203,6 +2203,60 @@ class GatewayRunner:
         else:
             pending_slot[session_key] = queued_event
 
+    def _dispatch_action_proposal_decision_event(
+        self,
+        session_key: str,
+        queued_event: "MessageEvent",
+        adapter: Any,
+        loop: Optional[asyncio.AbstractEventLoop],
+    ) -> bool:
+        """Dispatch an action-proposal decision as a normal follow-up turn.
+
+        CTA clicks commonly happen after the proposal-sending agent turn has
+        finished, so merely placing the synthetic MessageEvent in
+        ``adapter._pending_messages`` would leave it stuck until another user
+        message arrives.  If the session is idle, enter through the adapter's
+        normal ``handle_message`` path so it creates a processing task and
+        delivers the eventual response.  If the session is active or the gateway
+        is draining, preserve FIFO semantics by queueing behind the current run.
+        """
+        if adapter is None:
+            return False
+
+        active_sessions = getattr(adapter, "_active_sessions", {}) or {}
+        running_agents = getattr(self, "_running_agents", {}) or {}
+        if (
+            session_key in active_sessions
+            or session_key in running_agents
+            or bool(getattr(self, "_draining", False))
+        ):
+            self._enqueue_fifo(session_key, queued_event, adapter)
+            return True
+
+        handle_message = getattr(adapter, "handle_message", None)
+        if handle_message is None:
+            self._enqueue_fifo(session_key, queued_event, adapter)
+            return False
+
+        future = safe_schedule_threadsafe(
+            handle_message(queued_event),
+            loop,
+            logger=logger,
+            log_message="action proposal decision dispatch scheduling error",
+        )
+        if future is None:
+            self._enqueue_fifo(session_key, queued_event, adapter)
+            return False
+
+        def _log_dispatch_failure(done_future) -> None:
+            try:
+                done_future.result()
+            except Exception as exc:
+                logger.warning("Action proposal decision dispatch failed: %s", exc)
+
+        future.add_done_callback(_log_dispatch_failure)
+        return True
+
     def _promote_queued_event(
         self,
         session_key: str,
@@ -15899,6 +15953,134 @@ class GatewayRunner:
                 return response
 
             agent.clarify_callback = _clarify_callback_sync
+
+            def _action_proposal_callback_sync(proposal_args: dict):
+                """Create and deliver a non-blocking interactive action proposal."""
+                from tools import action_proposal as _action_proposal_mod
+
+                if not _status_adapter:
+                    raise RuntimeError("no gateway adapter available for action proposal")
+
+                proposal = _action_proposal_mod.register_action_proposal(
+                    session_key=session_key or "",
+                    title=proposal_args.get("title", ""),
+                    body=proposal_args.get("body", ""),
+                    proposal_type=proposal_args.get("proposal_type", "chat_followup"),
+                    intent_key=proposal_args.get("intent_key"),
+                    payload=proposal_args.get("payload") or {},
+                    source_snapshot=proposal_args.get("source_snapshot") or {},
+                    source=source.to_dict() if hasattr(source, "to_dict") else {},
+                    expires_in_seconds=proposal_args.get("expires_in_seconds", 24 * 60 * 60),
+                )
+
+                send_result = None
+                send_ok = False
+                if getattr(type(_status_adapter), "send_action_proposal", None) is not None:
+                    try:
+                        fut = safe_schedule_threadsafe(
+                            _status_adapter.send_action_proposal(
+                                chat_id=_status_chat_id,
+                                proposal=proposal,
+                                metadata=_status_thread_metadata,
+                            ),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="send_action_proposal scheduling error",
+                        )
+                        if fut is None:
+                            raise RuntimeError("send_action_proposal: loop unavailable")
+                        send_result = fut.result(timeout=15)
+                        send_ok = bool(getattr(send_result, "success", False))
+                    except Exception as exc:
+                        logger.warning("Button action proposal send failed; falling back to text: %s", exc)
+
+                if not send_ok:
+                    fallback = (
+                        f"🧭 **{proposal.title}**\n\n"
+                        f"{proposal.body}\n\n"
+                        "CTA interattive non disponibili su questo adapter. "
+                        "Rispondi nel thread indicando: Approva, Modifica/commenta o Rifiuta."
+                    )
+                    try:
+                        fut = safe_schedule_threadsafe(
+                            _status_adapter.send(
+                                _status_chat_id,
+                                fallback,
+                                metadata=_status_thread_metadata,
+                            ),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="action proposal fallback send scheduling error",
+                        )
+                        if fut is None:
+                            raise RuntimeError("action proposal fallback: loop unavailable")
+                        send_result = fut.result(timeout=15)
+                        send_ok = bool(getattr(send_result, "success", False))
+                    except Exception as exc:
+                        _action_proposal_mod.cancel_action_proposal(proposal.proposal_id)
+                        raise RuntimeError(f"failed to deliver action proposal: {exc}") from exc
+
+                if not send_ok:
+                    _action_proposal_mod.cancel_action_proposal(proposal.proposal_id)
+                    err = getattr(send_result, "error", "unknown delivery error") if send_result is not None else "unknown delivery error"
+                    raise RuntimeError(f"failed to deliver action proposal: {err}")
+
+                message_id = getattr(send_result, "message_id", None)
+                _action_proposal_mod.mark_action_proposal_delivered(proposal.proposal_id, message_id)
+                return proposal
+
+            def _action_proposal_decision_callback(proposal, decision: dict):
+                """Queue a follow-up turn for a resolved action proposal."""
+                from tools.action_proposal import build_decision_prompt
+
+                try:
+                    src_data = proposal.source or {}
+                    proposal_source = SessionSource.from_dict(src_data) if src_data else source
+                except Exception:
+                    proposal_source = source
+
+                try:
+                    actor_id = str(decision.get("actor_id") or "")
+                    actor_name = str(decision.get("actor_name") or "")
+                    if actor_id:
+                        proposal_source.user_id = actor_id
+                    if actor_name:
+                        proposal_source.user_name = actor_name
+                except Exception:
+                    pass
+
+                adapter = self.adapters.get(proposal_source.platform)
+                if adapter is None:
+                    logger.warning(
+                        "Action proposal decision could not enqueue follow-up: no adapter for %s",
+                        proposal_source.platform,
+                    )
+                    return None
+
+                queued_event = MessageEvent(
+                    text=build_decision_prompt(proposal, decision),
+                    message_type=MessageType.TEXT,
+                    source=proposal_source,
+                    raw_message=None,
+                    message_id=str(proposal.message_id or "") or None,
+                    internal=True,
+                )
+                proposal_session_key = proposal.session_key or build_session_key(proposal_source)
+                self._dispatch_action_proposal_decision_event(
+                    proposal_session_key,
+                    queued_event,
+                    adapter,
+                    _loop_for_step,
+                )
+                return None
+
+            try:
+                from tools.action_proposal import set_action_proposal_decision_callback
+                set_action_proposal_decision_callback(_action_proposal_decision_callback)
+            except Exception as exc:
+                logger.debug("Could not install action proposal decision callback: %s", exc)
+
+            agent.action_proposal_callback = _action_proposal_callback_sync
 
             # Store agent reference for interrupt support
             agent_holder[0] = agent
